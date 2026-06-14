@@ -2,6 +2,9 @@ import os
 import json
 import re
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 _MCP_URL = (
     "https://api.anthropic.com/v2/ccr-sessions/cse_01763jZd33pJiwWaUcDNxNJd/mcp"
