@@ -1,6 +1,6 @@
 # Cortex
 
-> **Personal CRM & Hub de Projetos** — um "segundo cérebro" para Inteligência Comercial.
+> **Personal CRM & Hub de Projetos** — um "segundo cérebro".
 
 **Status:** 🟡 Em definição — visão & escopo. Ainda sem código.
 
