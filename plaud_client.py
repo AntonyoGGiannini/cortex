@@ -11,15 +11,26 @@ _MCP_URL = (
 )
 _SESSION_UUID = "cse_01763jZd33pJiwWaUcDNxNJd"
 _MCP_SERVER_ID = "49263282-122e-40a0-84e6-86412d28e703"
-_TOKEN_FILE = "/home/claude/.claude/remote/.session_ingress_token"
+_TOKEN_FILE_CANDIDATES = [
+    os.environ.get("CLAUDE_SESSION_INGRESS_TOKEN_FILE", ""),
+    "/home/claude/.claude/remote/.session_ingress_token",
+    os.path.expanduser("~/.claude/remote/.session_ingress_token"),
+]
 
 
 def _get_token() -> str:
     token = os.environ.get("PLAUD_API_TOKEN")
     if token:
         return token
-    with open(_TOKEN_FILE) as f:
-        return f.read().strip()
+    for path in _TOKEN_FILE_CANDIDATES:
+        if path and os.path.exists(path):
+            with open(path) as f:
+                return f.read().strip()
+    raise RuntimeError(
+        "Token de autenticação não encontrado. "
+        "Defina a variável de ambiente PLAUD_API_TOKEN com o token sk-ant-si-... "
+        "ou execute o app dentro do ambiente Claude Code."
+    )
 
 
 def _call_tool(name: str, arguments: dict) -> str:
