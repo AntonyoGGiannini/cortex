@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import plaud_client as pc
+import server as pc
 
 st.set_page_config(
     page_title="Gravações",

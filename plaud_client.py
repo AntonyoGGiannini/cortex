@@ -1,177 +1,179 @@
+"""Cliente direto da API Plaud.ai, reutilizável pelo servidor MCP e pelo pipeline.
+
+Centraliza autenticação, paginação e parsing de transcrição/outline/summary, de
+forma tolerante aos diferentes formatos que a API retorna. O pipeline programado
+usa este cliente diretamente (não passa pela camada MCP).
+"""
+
 import os
 import json
-import re
-import requests
-import threading
-from dotenv import load_dotenv
+import gzip
+import datetime
 
-load_dotenv()
+import httpx
 
-# Anthropic MCP proxy (usado quando PLAUD_API_TOKEN = sk-ant-si-...)
-_PROXY_URL = (
-    "https://api.anthropic.com/v2/ccr-sessions/cse_01763jZd33pJiwWaUcDNxNJd/mcp"
-    "?mcp_url=https%3A%2F%2Fplaud-production.up.railway.app%2Fsse"
-    "&mcp_server_id=41123f61-4ab7-5aa0-91c8-c29b77fcb683"
-    "&toolbox_mcp_server_id=49263282-122e-40a0-84e6-86412d28e703"
-)
-_SESSION_UUID = "cse_01763jZd33pJiwWaUcDNxNJd"
-_MCP_SERVER_ID = "49263282-122e-40a0-84e6-86412d28e703"
+PLAUD_API = "https://api.plaud.ai"
 
-# Plaud MCP server direto (usado quando PLAUD_JWT_TOKEN = eyJ...)
-_PLAUD_MCP_SSE = "https://plaud-production.up.railway.app/sse"
-
-_TOKEN_FILE_CANDIDATES = [
-    os.environ.get("CLAUDE_SESSION_INGRESS_TOKEN_FILE", ""),
-    "/home/claude/.claude/remote/.session_ingress_token",
-    os.path.expanduser("~/.claude/remote/.session_ingress_token"),
-]
+# data_types conhecidos do content_list, em ordem de preferência para o "resumo".
+# O output do template (ex.: "meeting") costuma vir como "summary"; o outline de
+# tópicos vem como "outline"; a transcrição como "transaction".
+TRANSCRIPT_TYPES = ("transaction", "transcript", "trans")
+OUTLINE_TYPES = ("outline",)
+SUMMARY_TYPES = ("summary", "ai_summary", "ai_content", "template", "mindmap")
 
 
-def _get_session_token() -> str | None:
-    token = os.environ.get("PLAUD_API_TOKEN", "")
-    if token and token.startswith("sk-ant-si-"):
-        return token
-    for path in _TOKEN_FILE_CANDIDATES:
-        if path and os.path.exists(path):
-            with open(path) as f:
-                return f.read().strip()
-    return None
+def _to_seconds(ts) -> float | None:
+    """Normaliza timestamps que podem vir em ms ou s."""
+    if not ts:
+        return None
+    ts = float(ts)
+    return ts / 1000 if ts > 1e10 else ts
 
 
-def _get_jwt() -> str | None:
-    token = os.environ.get("PLAUD_JWT_TOKEN", "")
-    return token if token.startswith("eyJ") else None
+def _fmt_clock(ms_or_s) -> str:
+    """Formata um start_time (ms) como [mm:ss]."""
+    if ms_or_s in (None, ""):
+        return ""
+    secs = int(float(ms_or_s)) // 1000
+    return f"[{secs // 60:02d}:{secs % 60:02d}] "
 
 
-def _call_via_proxy(name: str, arguments: dict) -> str:
-    """Chama via proxy Anthropic com o token de sessão Claude Code."""
-    token = _get_session_token()
-    if not token:
-        raise RuntimeError("Token de sessão Claude Code não encontrado.")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Session-UUID": _SESSION_UUID,
-        "X-MCP-Server-ID": _MCP_SERVER_ID,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }
-    resp = requests.post(_PROXY_URL, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
-    for line in resp.text.splitlines():
-        if line.startswith("data: "):
-            data = json.loads(line[6:])
-            result = data.get("result", {})
-            if result.get("isError"):
-                raise RuntimeError(result["content"][0]["text"])
-            return result["content"][0]["text"]
-    raise ValueError("Nenhum dado retornado pelo proxy")
+class PlaudClient:
+    def __init__(self, token: str | None = None, timeout: int = 30):
+        self.token = token or os.environ.get("PLAUD_TOKEN", "")
+        self.timeout = timeout
 
+    # --- HTTP base ---
+    def _headers(self) -> dict:
+        return {"Authorization": self.token, "Content-Type": "application/json"}
 
-def _call_via_mcp_sse(name: str, arguments: dict) -> str:
-    """Chama o servidor MCP do Plaud diretamente com o JWT do usuário."""
-    jwt = _get_jwt()
-    if not jwt:
-        raise RuntimeError("PLAUD_JWT_TOKEN não definido no .env")
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = f"{PLAUD_API}{path}"
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.get(url, headers=self._headers(), params=params or {})
+            r.raise_for_status()
+            return r.json()
 
-    headers_auth = {"Authorization": f"Bearer {jwt}"}
-    messages_endpoint: list[str] = []
-    error: list[Exception] = []
-    result_data: list[str] = []
-    done = threading.Event()
+    # --- Listagem ---
+    def list_recordings_page(self, page: int = 1, page_size: int = 50) -> list[dict]:
+        data = self._get("/file/simple/web", {"page": page, "page_size": page_size})
+        if isinstance(data, dict):
+            files = data.get("data") or data.get("data_file_list") or []
+            if isinstance(files, dict):
+                files = files.get("list") or files.get("files") or []
+        else:
+            files = data if isinstance(data, list) else []
+        return files or []
 
-    def listen_sse():
-        try:
-            with requests.get(
-                _PLAUD_MCP_SSE, headers=headers_auth, stream=True, timeout=15
-            ) as sse_resp:
-                sse_resp.raise_for_status()
-                event_type = ""
-                for raw in sse_resp.iter_lines(decode_unicode=True):
-                    if not raw:
-                        event_type = ""
-                        continue
-                    if raw.startswith("event:"):
-                        event_type = raw[6:].strip()
-                    elif raw.startswith("data:"):
-                        data_val = raw[5:].strip()
-                        if event_type == "endpoint":
-                            base = _PLAUD_MCP_SSE.rsplit("/sse", 1)[0]
-                            messages_endpoint.append(base + data_val)
-                            done.set()
-                            return
-        except Exception as e:
-            error.append(e)
-            done.set()
+    def iter_recordings(self, page_size: int = 100, max_pages: int = 100):
+        """Itera por todas as gravações, página a página."""
+        for page in range(1, max_pages + 1):
+            files = self.list_recordings_page(page=page, page_size=page_size)
+            if not files:
+                return
+            for f in files:
+                yield f
+            if len(files) < page_size:
+                return
 
-    t = threading.Thread(target=listen_sse, daemon=True)
-    t.start()
-    done.wait(timeout=10)
+    @staticmethod
+    def summarize_listing(f: dict) -> dict:
+        """Resumo enxuto de um item de listagem (sem transcrição)."""
+        duration_ms = f.get("duration") or 0
+        start_ts = f.get("start_time")
+        created = None
+        if start_ts:
+            created = datetime.datetime.utcfromtimestamp(
+                _to_seconds(start_ts)
+            ).strftime("%Y-%m-%d %H:%M")
+        return {
+            "id": f.get("id") or f.get("file_id"),
+            "name": f.get("filename") or f.get("file_name") or f.get("name") or "sem nome",
+            "duration_min": round(duration_ms / 60000, 1),
+            "created_at": created,
+            "has_transcript": bool(f.get("is_trans") or f.get("has_transcription")),
+            "has_summary": bool(f.get("is_summary") or f.get("has_summary")),
+        }
 
-    if error:
-        raise RuntimeError(f"Erro ao conectar no MCP SSE: {error[0]}")
-    if not messages_endpoint:
-        raise RuntimeError("Endpoint do MCP não retornado via SSE")
+    # --- Detalhe ---
+    def get_detail(self, file_id: str) -> dict:
+        """Detalhe COMPLETO da gravação, incluindo content_list."""
+        data = self._get(f"/file/detail/{file_id}")
+        file_data = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(file_data, dict):
+            file_data = data if isinstance(data, dict) else {}
+        return file_data
 
-    endpoint = messages_endpoint[0]
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
-    }
-    resp = requests.post(endpoint, headers={**headers_auth, "Content-Type": "application/json"}, json=payload, timeout=30)
-    resp.raise_for_status()
-    for line in resp.text.splitlines():
-        if line.startswith("data: "):
-            data = json.loads(line[6:])
-            result = data.get("result", {})
-            if result.get("isError"):
-                raise RuntimeError(result["content"][0]["text"])
-            return result["content"][0]["text"]
-    raise ValueError("Nenhum dado retornado pelo MCP direto")
+    @staticmethod
+    def content_types(file_data: dict) -> list[dict]:
+        """Enumera os data_types disponíveis no content_list (para diagnóstico)."""
+        return [
+            {"data_type": item.get("data_type"), "task_status": item.get("task_status")}
+            for item in file_data.get("content_list", [])
+        ]
 
+    def _find_content(self, file_data: dict, data_types) -> dict | None:
+        for dt in data_types:
+            for item in file_data.get("content_list", []):
+                if item.get("data_type") == dt and item.get("task_status") == 1:
+                    return item
+        return None
 
-def _call_tool(name: str, arguments: dict) -> str:
-    """Detecta automaticamente o modo.
+    def _fetch_link(self, data_link: str):
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.get(data_link)
+            r.raise_for_status()
+            content = r.content
+        if data_link.endswith(".gz") or content[:2] == b"\x1f\x8b":
+            content = gzip.decompress(content)
+        return json.loads(content)
 
-    Prioridade:
-    1. Arquivo de sessão Claude Code presente → proxy Anthropic (ambiente remoto)
-    2. PLAUD_JWT_TOKEN definido → MCP direto (máquina local)
-    3. PLAUD_API_TOKEN definido → proxy Anthropic (fallback)
-    """
-    for path in _TOKEN_FILE_CANDIDATES:
-        if path and os.path.exists(path):
-            return _call_via_proxy(name, arguments)
-    if _get_jwt():
-        return _call_via_mcp_sse(name, arguments)
-    if _get_session_token():
-        return _call_via_proxy(name, arguments)
-    raise RuntimeError(
-        "Nenhuma credencial encontrada.\n"
-        "Adicione ao arquivo .env:\n"
-        "  PLAUD_JWT_TOKEN=eyJ...   ← token do app Plaud (permanente, para rodar localmente)\n"
-        "  ou\n"
-        "  PLAUD_API_TOKEN=sk-ant-si-...   ← token de sessão Claude Code"
-    )
+    def _load(self, file_data: dict, data_types):
+        item = self._find_content(file_data, data_types)
+        if not item or not item.get("data_link"):
+            return None
+        return self._fetch_link(item["data_link"])
 
+    # --- Conteúdos ---
+    def get_transcript_segments(self, file_data: dict) -> list[dict]:
+        trans = self._load(file_data, TRANSCRIPT_TYPES)
+        if isinstance(trans, list):
+            return trans
+        if isinstance(trans, dict):
+            return trans.get("segments") or trans.get("words") or []
+        return []
 
-def list_recordings(limit: int = 30) -> list[dict]:
-    return json.loads(_call_tool("list_recordings", {"limit": limit}))
+    @staticmethod
+    def segments_to_text(segments: list[dict]) -> str:
+        lines = []
+        for seg in segments:
+            speaker = seg.get("speaker") or seg.get("spk") or "?"
+            text = (seg.get("content") or seg.get("text") or "").strip()
+            start = seg.get("start_time") or seg.get("start") or ""
+            lines.append(f"{_fmt_clock(start)}{speaker}: {text}")
+        return "\n".join(lines)
 
+    def get_transcript_text(self, file_data: dict) -> str:
+        return self.segments_to_text(self.get_transcript_segments(file_data))
 
-def get_recording_detail(file_id: str) -> dict:
-    return json.loads(_call_tool("get_recording_detail", {"file_id": file_id}))
+    def get_outline(self, file_data: dict):
+        """Outline de tópicos com timestamps (data_type 'outline')."""
+        return self._load(file_data, OUTLINE_TYPES)
 
+    def get_summary(self, file_data: dict):
+        """Output do template (ex.: Meeting Note). Cai no outline se não houver."""
+        summary = self._load(file_data, SUMMARY_TYPES)
+        if summary is not None:
+            return summary
+        return self.get_outline(file_data)
 
-def get_transcript(file_id: str) -> str:
-    return _call_tool("get_transcript", {"file_id": file_id})
-
-
-def extract_speakers(transcript: str) -> list[str]:
-    names = re.findall(r"\]\s+([^:\n]+):", transcript)
-    return sorted(set(n.strip() for n in names if n.strip()))
+    @staticmethod
+    def template_header(file_data: dict) -> dict:
+        """Metadados do template usado e cabeçalho de IA (categoria, headline...)."""
+        extra = file_data.get("extra_data") or {}
+        return {
+            "used_template": extra.get("used_template") or {},
+            "ai_content_header": extra.get("aiContentHeader") or {},
+            "language": (extra.get("tranConfig") or {}).get("language"),
+            "diarization": (extra.get("tranConfig") or {}).get("diarization"),
+        }
