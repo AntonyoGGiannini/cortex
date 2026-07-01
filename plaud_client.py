@@ -11,6 +11,9 @@ import gzip
 import datetime
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 PLAUD_API = "https://api.plaud.ai"
 
@@ -21,6 +24,13 @@ TRANSCRIPT_TYPES = ("transaction", "transcript", "trans")
 OUTLINE_TYPES = ("outline",)
 SUMMARY_TYPES = ("summary", "ai_summary", "ai_content", "template", "mindmap")
 
+def _normalize_token(token: str | None) -> str:
+    token = (token or "").strip()
+    if not token:
+        return ""
+    if token.lower().startswith("bearer "):
+        return token
+    return f"Bearer {token}"
 
 def _to_seconds(ts) -> float | None:
     """Normaliza timestamps que podem vir em ms ou s."""
@@ -40,18 +50,31 @@ def _fmt_clock(ms_or_s) -> str:
 
 class PlaudClient:
     def __init__(self, token: str | None = None, timeout: int = 30):
-        self.token = token or os.environ.get("PLAUD_TOKEN", "")
+        self.token = _normalize_token(token or os.environ.get("PLAUD_TOKEN"))
         self.timeout = timeout
 
     # --- HTTP base ---
     def _headers(self) -> dict:
+        if not self.token:
+            raise RuntimeError(
+                "PLAUD_TOKEN nao configurado. Crie um arquivo .env com "
+                "PLAUD_TOKEN=Bearer SEU_TOKEN_AQUI"
+            )
         return {"Authorization": self.token, "Content-Type": "application/json"}
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{PLAUD_API}{path}"
         with httpx.Client(timeout=self.timeout) as client:
             r = client.get(url, headers=self._headers(), params=params or {})
-            r.raise_for_status()
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    raise RuntimeError(
+                        "Plaud retornou 401 Unauthorized. O PLAUD_TOKEN esta "
+                        "ausente, expirado ou invalido."
+                    ) from exc
+                raise
             return r.json()
 
     # --- Listagem ---
@@ -82,10 +105,11 @@ class PlaudClient:
         duration_ms = f.get("duration") or 0
         start_ts = f.get("start_time")
         created = None
-        if start_ts:
-            created = datetime.datetime.utcfromtimestamp(
-                _to_seconds(start_ts)
-            ).strftime("%Y-%m-%d %H:%M")
+        ts = _to_seconds(start_ts)
+        if ts is not None:
+            created = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
         return {
             "id": f.get("id") or f.get("file_id"),
             "name": f.get("filename") or f.get("file_name") or f.get("name") or "sem nome",
@@ -166,6 +190,88 @@ class PlaudClient:
         if summary is not None:
             return summary
         return self.get_outline(file_data)
+
+    def get_speakers(self, file_id: str) -> list[dict]:
+        """Retorna os speakers únicos da gravação com estatísticas básicas.
+
+        Cada segmento pode ter dois campos de speaker:
+          - original_speaker: label genérico original ("Speaker 1")
+          - speaker: nome real identificado ("Antonyo Giannini"), quando disponível
+
+        Retorna por speaker:
+          - original_label: label original ("Speaker 1")
+          - name: nome identificado, ou None se não foi identificado
+          - identified: True se o nome real foi atribuído
+          - segments: quantidade de segmentos
+          - first_at: timestamp mm:ss da primeira fala
+          - talk_time: tempo total de fala em mm:ss
+          - talk_seconds: tempo total de fala em segundos (inteiro)
+          - talk_words: total de palavras faladas pelo speaker
+        """
+        file_data = self.get_detail(file_id)
+        segments = self.get_transcript_segments(file_data)
+
+        # Chave de agrupamento: a IDENTIDADE REAL (nome) quando houver; só caímos
+        # no rótulo genérico (original_speaker) para quem não foi identificado.
+        # (Bug histórico: agrupar por original_speaker espalhava a mesma pessoa
+        # por vários "Speaker N", e o backfill, ao indexar por nome, perdia todos
+        # os pedaços menos um — subcontando drasticamente a fala.)
+        speakers: dict[str, dict] = {}
+        for seg in segments:
+            original = (seg.get("original_speaker") or "").strip()
+            identified_name = (seg.get("speaker") or seg.get("spk") or "").strip()
+            key = identified_name or original or "?"
+
+            start  = seg.get("start_time") or seg.get("start") or 0
+            end    = seg.get("end_time")   or seg.get("end")   or 0
+            dur_ms = seg.get("duration") or 0
+
+            # Os timestamps do Plaud são relativos e vêm em MILISSEGUNDOS
+            # (ex.: 25 min = 1.500.000 ms). Mantemos tudo em ms aqui e só
+            # convertemos para segundos no final. (Bug histórico: o fallback
+            # multiplicava (end-start) por 1000, inflando ~1000x.)
+            if dur_ms:
+                seg_ms = float(dur_ms)
+            elif end:  # start pode ser 0 (1º segmento) — não usar 'and start'
+                seg_ms = max(0.0, float(end) - float(start))
+            else:
+                seg_ms = 0.0
+
+            # palavras faladas no segmento (métrica robusta a erro de timestamp)
+            text = (seg.get("content") or seg.get("text") or seg.get("note") or "")
+            seg_words = len(str(text).split())
+
+            if key not in speakers:
+                speakers[key] = {
+                    "original_label": original or key,
+                    "name": identified_name or None,
+                    "segments": 0,
+                    "first_at": _fmt_clock(start).strip(),
+                    "_total_ms": 0.0,
+                    "_words": 0,
+                }
+            # atualiza name se ainda não estava preenchido
+            if speakers[key]["name"] is None and identified_name:
+                speakers[key]["name"] = identified_name
+            speakers[key]["segments"] += 1
+            speakers[key]["_total_ms"] += seg_ms
+            speakers[key]["_words"] += seg_words
+
+        result = []
+        for spk in speakers.values():
+            total_s = int(spk.pop("_total_ms") / 1000)
+            words = spk.pop("_words")
+            talk_time = f"{total_s // 60:02d}:{total_s % 60:02d}" if total_s else "00:00"
+            result.append({
+                **spk,
+                "identified": spk["name"] is not None,
+                "talk_time": talk_time,
+                "talk_seconds": total_s,
+                "talk_words": words,
+            })
+
+        result.sort(key=lambda x: x["segments"], reverse=True)
+        return result
 
     @staticmethod
     def template_header(file_data: dict) -> dict:

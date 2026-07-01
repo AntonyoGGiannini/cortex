@@ -27,6 +27,11 @@ BORDER_STRONG = "#CBD5E1"
 
 
 def inject_css() -> None:
+    # Gate de acesso centralizado: toda página chama inject_css() logo após
+    # set_page_config, então isto protege todas as telas de uma vez.
+    from lib.auth import require_login
+
+    require_login()
     st.markdown(
         """
         <style>

@@ -14,14 +14,11 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from lib.auth import require_login
-
 from lib.ui import inject_css, page_header, status_bar, empty_state, filter_header
 from lib.config import SUPABASE_SERVICE_KEY, ME_SPEAKER_KEY
 from lib import db
 
 st.set_page_config(page_title="Cortex · Dashboard", page_icon="📊", layout="wide")
-require_login()
 inject_css()
 page_header("📊 Dashboard", "Reuniões × pessoas — atenção, fala/escuta, cadência e captura")
 
@@ -297,4 +294,3 @@ status_bar(
     f"{n_reunioes} reuniões · {n_stake} stakeholders · recorte: {periodo.lower()} · "
     f"fala/escuta por palavras (exato) · {_fresh_txt}"
 )
- 

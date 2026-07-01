@@ -2,15 +2,12 @@
 
 import streamlit as st
 
-from lib.auth import require_login
-
 from lib.ui import inject_css, page_header, status_bar, badge, empty_state, filter_header
 from lib.config import SPEAKER_TYPES, DIRETORIAS, AREAS
 from lib.normalize import normalize_name
 from lib import db, plaud_service as ps
 
 st.set_page_config(page_title="Contatos · Cortex", page_icon="👥", layout="wide")
-require_login()
 inject_css()
 page_header("👥 Contatos", "Participantes únicos por nome normalizado · dim_speakers")
 
@@ -275,4 +272,3 @@ else:
                 speaker_dialog(s)
 
 status_bar(f"{len(speakers)} contatos em dim_speakers")
-         

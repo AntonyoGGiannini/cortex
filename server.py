@@ -9,11 +9,10 @@ import json
 
 from mcp.server.fastmcp import FastMCP
 
-from server import PlaudClient
+from plaud_client import PlaudClient
 
 mcp = FastMCP("plaud", host="0.0.0.0", stateless_http=True)
 client = PlaudClient()
-
 
 @mcp.tool()
 def list_recordings(limit: int = 20) -> str:
@@ -45,10 +44,14 @@ def get_summary(file_id: str) -> str:
 def get_recording_detail(file_id: str) -> str:
     """Retorna todos os metadados de uma gravação (nome, duração, falantes, tags etc)."""
     file_data = client.get_detail(file_id)
+    # for item in file_data:
+    #     print(f"{item}: {file_data[item]}")
+    #     print('---------------------------')
+    
     meta = {
         k: v
         for k, v in file_data.items()
-        if k not in ("content_list", "embeddings", "download_path_mapping", "pre_download_content_list")
+        if k not in ("content_list", "download_path_mapping")
     }
     return json.dumps(meta, ensure_ascii=False, indent=2)
 

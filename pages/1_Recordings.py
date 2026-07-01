@@ -4,8 +4,6 @@ import datetime as dt
 
 import streamlit as st
 
-from lib.auth import require_login
-
 from lib.ui import (
     inject_css, page_header, status_bar, fmt_duration, badge,
     empty_state, filter_header,
@@ -15,7 +13,6 @@ from lib.normalize import normalize_name
 from lib import db, plaud_service as ps
 
 st.set_page_config(page_title="Reuniões · Cortex", page_icon="🎙️", layout="wide")
-require_login()
 inject_css()
 page_header("🎙️ Reuniões", "Lista do Plaud · revise e salve em fact_recordings")
 
@@ -367,4 +364,3 @@ status_bar(
     f"{len(filtered)} de {len(recordings)} reuniões exibidas · "
     f"{len(registered)} já no banco"
 )
-                        

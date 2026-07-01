@@ -7,14 +7,11 @@ citável por reunião. Uso: notas de trabalho para negociar com cada stakeholder
 
 import streamlit as st
 
-from lib.auth import require_login
-
 from lib.ui import inject_css, page_header, badge, status_bar, empty_state, filter_header
 from lib import db, profiling
 from lib.config import ANTHROPIC_API_KEY
 
 st.set_page_config(page_title="Perfil Comportamental · Cortex", page_icon="🧠", layout="wide")
-require_login()
 inject_css()
 page_header(
     "🧠 Perfil Comportamental",
@@ -233,4 +230,11 @@ for p in rows:
                         f"{DIM_LABELS.get(o.get('dimension'), o.get('dimension'))}</span> — "
                         f"{o.get('trait_label')}"
                         f"<br><span style='color:#8A93A2'>“{o.get('evidence') or ''}” "
-                        f"· conf {o.get('conf_o
+                        f"· conf {o.get('conf_obs')}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+status_bar(
+    "Inferência automática sobre transcrições · confiança = consistência × maturidade "
+    "(shrinkage). Notas de trabalho, não avaliação de pessoas. Trate como confidencial."
+)
